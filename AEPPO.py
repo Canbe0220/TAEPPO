@@ -1,0 +1,423 @@
+import copy
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import Categorical
+from TARAN import RAN_O, RAN_M
+from mlp import MLPCritic, MLPActor
+
+class Memory:
+    def __init__(self):
+        self.states = []
+        self.logprobs = []
+        self.rewards = []
+        self.is_terminals = []
+        self.action_indexes = []
+        
+        self.ope_ma_adj = []
+        self.ope_pre_adj = []
+        self.ope_sub_adj = []
+        self.opes_mask_adj = []
+        self.opes_mask_job = []
+        self.batch_idxes = []
+        self.raw_opes = []
+        self.raw_mas = []
+        self.proc_pair = []
+        self.proc_time = []
+        self.jobs_gather = []
+        self.eligible = []
+        self.nums_opes = []
+        
+        
+    def clear_memory(self):
+        del self.states[:]
+        del self.logprobs[:]
+        del self.rewards[:]
+        del self.is_terminals[:]
+        del self.action_indexes[:]
+        
+        del self.ope_ma_adj[:]
+        del self.ope_pre_adj[:]
+        del self.ope_sub_adj[:]
+        del self.opes_mask_adj[:]
+        del self.opes_mask_job[:]
+        del self.batch_idxes[:]
+        del self.raw_opes[:]
+        del self.raw_mas[:]
+        del self.proc_pair[:]
+        del self.proc_time[:]
+        del self.jobs_gather[:]
+        del self.eligible[:]
+        del self.nums_opes[:]
+
+class TAEPPO(nn.Module):
+    def __init__(self, model_paras):
+        super(TAEPPO, self).__init__()
+        self.device = model_paras["device"]
+        self.in_size_ma = model_paras["in_size_ma"]  # Dimension of the raw feature vectors of machine nodes
+        self.out_size_ma = model_paras["out_size_ma"]  # Dimension of the embedding of machine nodes
+        self.in_size_ope = model_paras["in_size_ope"]  # Dimension of the raw feature vectors of operation nodes
+        self.out_size_ope = model_paras["out_size_ope"]  # Dimension of the embedding of operation nodes
+        self.hidden_size_ope = model_paras["hidden_size_ope"]  # Hidden dimensions of the MLPs
+        self.actor_dim = model_paras["actor_in_dim"]  # Input dimension of actor
+        self.critic_dim = model_paras["critic_in_dim"]  # Input dimension of critic
+        self.n_latent_actor = model_paras["n_latent_actor"]  # Hidden dimensions of the actor
+        self.n_latent_critic = model_paras["n_latent_critic"]  # Hidden dimensions of the critic
+        self.n_hidden_actor = model_paras["n_hidden_actor"]  # Number of layers in actor
+        self.n_hidden_critic = model_paras["n_hidden_critic"]  # Number of layers in critic
+        self.action_dim = model_paras["action_dim"]  # Output dimension of actor
+
+        # len() means of the number of HGNN iterations
+        # and the element means the number of heads of each HGNN (=1 in final experiment)
+        self.num_heads = model_paras["num_heads"]
+        self.dropout = model_paras["dropout"]
+
+        self.get_operations = RAN_O(self.in_size_ope, self.out_size_ope, self.dropout, self.dropout)
+        self.get_machines = RAN_M((self.in_size_ope, self.in_size_ma), self.out_size_ma, self.dropout, self.dropout)
+
+        self.actor = MLPActor(self.n_hidden_actor, self.actor_dim, self.n_latent_actor, self.action_dim).to(self.device)
+        self.critic = MLPCritic(self.n_hidden_critic, self.critic_dim, self.n_latent_critic, 1).to(self.device)
+
+    def forward(self):
+        '''
+        Replaced by separate act and evaluate functions
+        '''
+        raise NotImplementedError
+
+    def feature_normalize(self, data):
+        return (data - torch.mean(data)) / ((data.std() + 1e-5))
+
+    '''
+        raw_opes: shape: [len(batch_idxes), max(num_opes), in_size_ope]
+        raw_mas: shape: [len(batch_idxes), num_mas, in_size_ma]
+        proc_time: shape: [len(batch_idxes), max(num_opes), num_mas]
+    '''
+    def get_normalized(self, raw_opes, raw_mas, proc_time, batch_idxes, nums_opes, flag_sample=False, flag_train=False):
+        '''
+        :param raw_opes: Raw feature vectors of operation nodes
+        :param raw_mas: Raw feature vectors of machines nodes
+        :param proc_time: Processing time
+        :param batch_idxes: Uncompleted instances
+        :param nums_opes: The number of operations for each instance
+        :param flag_sample: Flag for DRL-S
+        :param flag_train: Flag for training
+        :return: Normalized feats, including operations, machines and edges
+        '''
+        batch_size = batch_idxes.size(0)  # number of uncompleted instances
+
+        # There may be different operations for each instance, which cannot be normalized directly by the matrix
+        if not flag_sample and not flag_train:
+            mean_opes = []
+            std_opes = []
+            for i in range(batch_size):
+                mean_opes.append(torch.mean(raw_opes[i, :nums_opes[i], :], dim=-2, keepdim=True))
+                std_opes.append(torch.std(raw_opes[i, :nums_opes[i], :], dim=-2, keepdim=True))
+                proc_idxes = torch.nonzero(proc_time[i])
+                proc_values = proc_time[i, proc_idxes[:, 0], proc_idxes[:, 1]]
+                proc_norm = self.feature_normalize(proc_values)
+                proc_time[i, proc_idxes[:, 0], proc_idxes[:, 1]] = proc_norm
+            mean_opes = torch.stack(mean_opes, dim=0)
+            std_opes = torch.stack(std_opes, dim=0)
+            mean_mas = torch.mean(raw_mas, dim=-2, keepdim=True)
+            std_mas = torch.std(raw_mas, dim=-2, keepdim=True)
+            proc_time_norm = proc_time
+        # DRL-S and scheduling during training have a consistent number of operations
+        else:
+            mean_opes = torch.mean(raw_opes, dim=-2, keepdim=True)  # shape: [len(batch_idxes), 1, in_size_ope]
+            mean_mas = torch.mean(raw_mas, dim=-2, keepdim=True)  # shape: [len(batch_idxes), 1, in_size_ma]
+            std_opes = torch.std(raw_opes, dim=-2, keepdim=True)  # shape: [len(batch_idxes), 1, in_size_ope]
+            std_mas = torch.std(raw_mas, dim=-2, keepdim=True)  # shape: [len(batch_idxes), 1, in_size_ma]
+            proc_time_norm = self.feature_normalize(proc_time)  # shape: [len(batch_idxes), num_opes, num_mas]
+        return ((raw_opes - mean_opes) / (std_opes + 1e-8), (raw_mas - mean_mas) / (std_mas + 1e-8),
+                proc_time_norm)
+
+    def get_action_prob(self, state, memories, flag_sample=False, flag_train=False):
+        '''
+        Get the probability of selecting each action in decision-making
+        '''
+        # Uncompleted instances
+        batch_idxes = state.batch_idxes
+        # Raw feats
+        raw_opes = state.feat_opes_batch.transpose(1, 2)[batch_idxes]
+        raw_mas = state.feat_mas_batch.transpose(1, 2)[batch_idxes]
+        proc_pair = state.proc_pair_batch
+        proc_time = state.proc_times_batch[batch_idxes]
+        # Normalize
+        nums_opes = state.nums_opes_batch[batch_idxes]
+        features = self.get_normalized(raw_opes, raw_mas, proc_time, batch_idxes, nums_opes, flag_sample, flag_train)
+        norm_opes = (copy.deepcopy(features[0]))
+        norm_mas = (copy.deepcopy(features[1]))
+        norm_proc = (copy.deepcopy(features[2]))
+
+        opes_mask_adj = state.opes_mask_adj
+        opes_mask_job = state.opes_mask_job
+        h_opes = self.get_operations(opes_mask_adj, opes_mask_job, state.batch_idxes, features[0])
+        h_mas = self.get_machines(state.ope_ma_adj_batch, state.batch_idxes, features)
+        h_pair = proc_pair[batch_idxes]
+
+        # Stacking and pooling
+        h_mas_pooled = h_mas.mean(dim=-2)  # shape: [len(batch_idxes), out_size_ma]
+        # There may be different operations for each instance, which cannot be pooled directly by the matrix
+        if not flag_sample and not flag_train:
+            h_opes_pooled = []
+            for i in range(len(batch_idxes)):
+                h_opes_pooled.append(torch.mean(h_opes[i, :nums_opes[i], :], dim=-2))
+            h_opes_pooled = torch.stack(h_opes_pooled)  # shape: [len(batch_idxes), d]
+        else:
+            h_opes_pooled = h_opes.mean(dim=-2)  # shape: [len(batch_idxes), out_size_ope]
+
+        # Detect eligible O-M pairs (eligible actions) and generate tensors for actor calculation
+        ope_step_batch = torch.where(state.ope_step_batch > state.end_ope_biases_batch,
+                                     state.end_ope_biases_batch, state.ope_step_batch)
+        jobs_gather = ope_step_batch[..., :, None].expand(-1, -1, h_opes.size(-1))[batch_idxes]
+        h_jobs = h_opes.gather(1, jobs_gather)
+        # Matrix indicating whether processing is possible
+        # shape: [len(batch_idxes), num_jobs, num_mas]
+        eligible_proc = state.ope_ma_adj_batch[batch_idxes].gather(1,
+                          ope_step_batch[..., :, None].expand(-1, -1, state.ope_ma_adj_batch.size(-1))[batch_idxes])
+        h_jobs_padding = h_jobs.unsqueeze(-2).expand(-1, -1, state.proc_times_batch.size(-1), -1)
+        h_mas_padding = h_mas.unsqueeze(-3).expand_as(h_jobs_padding)
+        h_mas_pooled_padding = h_mas_pooled[:, None, None, :].expand_as(h_jobs_padding)
+        h_opes_pooled_padding = h_opes_pooled[:, None, None, :].expand_as(h_jobs_padding)
+        # Matrix indicating whether machine is eligible
+        # shape: [len(batch_idxes), num_jobs, num_mas]
+        ma_eligible = ~state.mask_ma_procing_batch[batch_idxes].unsqueeze(1).expand_as(h_jobs_padding[..., 0])
+        # Matrix indicating whether job is eligible
+        # shape: [len(batch_idxes), num_jobs, num_mas]
+        job_eligible = ~(state.mask_job_procing_batch[batch_idxes] +
+                         state.mask_job_finish_batch[batch_idxes])[:, :, None].expand_as(h_jobs_padding[..., 0])
+        # shape: [len(batch_idxes), num_jobs, num_mas]
+        eligible = job_eligible & ma_eligible & (eligible_proc == 1)
+        if (~(eligible)).all():
+            print("No eligible O-M pair!")
+            return
+        # Input of actor MLP
+        # shape: [len(batch_idxes), num_mas, num_jobs, out_size_ma*2+out_size_ope*2]
+        
+        h_actions = torch.cat((h_jobs_padding, h_mas_padding, h_pair), dim=-1).transpose(1, 2)
+        h_pooled = torch.cat((h_opes_pooled, h_mas_pooled), dim=-1)  # deprecated
+        mask = eligible.transpose(1, 2).flatten(1)
+
+        # Get priority index and probability of actions with masking the ineligible actions
+        scores = self.actor(h_actions).flatten(1)
+        scores[~mask] = float('-inf')
+        action_probs = F.softmax(scores, dim=1)
+
+        # Store data in memory during training
+        if flag_train == True:
+            memories.ope_ma_adj.append(copy.deepcopy(state.ope_ma_adj_batch))
+            memories.ope_pre_adj.append(copy.deepcopy(state.ope_pre_adj_batch))
+            memories.ope_sub_adj.append(copy.deepcopy(state.ope_sub_adj_batch))
+            memories.opes_mask_adj.append(copy.deepcopy(opes_mask_adj))
+            memories.opes_mask_job.append(copy.deepcopy(opes_mask_job))
+            memories.batch_idxes.append(copy.deepcopy(state.batch_idxes))
+            memories.raw_opes.append(copy.deepcopy(norm_opes))
+            memories.raw_mas.append(copy.deepcopy(norm_mas))
+            memories.proc_pair.append(copy.deepcopy(proc_pair))
+            memories.proc_time.append(copy.deepcopy(norm_proc))
+            memories.nums_opes.append(copy.deepcopy(nums_opes))
+            memories.jobs_gather.append(copy.deepcopy(jobs_gather))
+            memories.eligible.append(copy.deepcopy(eligible))
+
+        return action_probs, ope_step_batch, h_pooled
+
+    def act(self, state, memories, dones, flag_sample=True, flag_train=True):
+        # Get probability of actions and the id of the current operation (be waiting to be processed) of each job
+        action_probs, ope_step_batch, _ = self.get_action_prob(state, memories, flag_sample, flag_train=flag_train)
+
+        # DRL-S, sampling actions following \pi
+        if flag_sample:
+            dist = Categorical(action_probs)
+            action_indexes = dist.sample()
+        # DRL-G, greedily picking actions with the maximum probability
+        else:
+            action_indexes = action_probs.argmax(dim=1)
+
+        # Calculate the machine, job and operation index based on the action index
+        mas = (action_indexes / state.mask_job_finish_batch.size(1)).long()
+        jobs = (action_indexes % state.mask_job_finish_batch.size(1)).long()
+        opes = ope_step_batch[state.batch_idxes, jobs]
+
+        # Store data in memory during training
+        if flag_train == True:
+            # memories.states.append(copy.deepcopy(state))
+            memories.logprobs.append(dist.log_prob(action_indexes))
+            memories.action_indexes.append(action_indexes)
+
+        return torch.stack((opes, mas, jobs), dim=1).t()
+
+    def evaluate(self, ope_ma_adj, ope_pre_adj, ope_sub_adj, opes_mask_adj, opes_mask_job, raw_opes, raw_mas, proc_pair, proc_time,
+                 jobs_gather, eligible, action_envs, flag_sample=False):
+        batch_idxes = torch.arange(0, ope_ma_adj.size(-3)).long()
+        features = (raw_opes, raw_mas, proc_time)
+
+        
+        h_opes = self.get_operations(opes_mask_adj, opes_mask_job, batch_idxes, features[0])
+        h_mas = self.get_machines(ope_ma_adj, batch_idxes, features)
+        h_pair = proc_pair[batch_idxes]
+
+        # Stacking and pooling
+        h_mas_pooled = h_mas.mean(dim=-2)
+        h_opes_pooled = h_opes.mean(dim=-2)
+
+        # Detect eligible O-M pairs (eligible actions) and generate tensors for critic calculation
+        h_jobs = h_opes.gather(1, jobs_gather)
+        h_jobs_padding = h_jobs.unsqueeze(-2).expand(-1, -1, proc_time.size(-1), -1)
+        h_mas_padding = h_mas.unsqueeze(-3).expand_as(h_jobs_padding)
+        h_mas_pooled_padding = h_mas_pooled[:, None, None, :].expand_as(h_jobs_padding)
+        h_opes_pooled_padding = h_opes_pooled[:, None, None, :].expand_as(h_jobs_padding)
+
+
+        h_actions = torch.cat((h_jobs_padding, h_mas_padding, h_pair), dim=-1).transpose(1, 2)
+        h_pooled = torch.cat((h_opes_pooled, h_mas_pooled), dim=-1)
+        scores = self.actor(h_actions).flatten(1)
+        mask = eligible.transpose(1, 2).flatten(1)
+
+        scores[~mask] = float('-inf')
+        action_probs = F.softmax(scores, dim=1)
+        state_values = self.critic(h_pooled)
+        dist = Categorical(action_probs.squeeze())
+        action_logprobs = dist.log_prob(action_envs)
+        dist_entropys = dist.entropy()
+        return action_logprobs, state_values.squeeze().double(), dist_entropys
+
+
+class AEPPO:
+    def __init__(self, model_paras, train_paras, num_envs=None):
+        self.lr = train_paras["lr"]  # learning rate
+        self.betas = train_paras["betas"]  # default value for Adam
+        self.gamma = train_paras["gamma"]  # discount factor
+        self.eps_clip = train_paras["eps_clip"]  # clip ratio for PPO
+        self.K_epochs = train_paras["K_epochs"]  # Update policy for K epochs
+        self.A_coeff = train_paras["A_coeff"]  # coefficient for policy loss
+        self.vf_coeff = train_paras["vf_coeff"]  # coefficient for value loss
+        self.entropy_coeff = train_paras["entropy_coeff"]  # coefficient for entropy term
+        self.num_envs = num_envs  # Number of parallel instances
+        self.minibatch_size = train_paras["minibatch_size"]
+        self.device = model_paras["device"]  # PyTorch device
+
+        self.policy = TAEPPO(model_paras).to(self.device)
+        self.policy_old = copy.deepcopy(self.policy)
+        self.policy_old.load_state_dict(self.policy.state_dict())
+
+        self.target_entropy_coeff = train_paras.get("target_entropy_coeff", 0.5) 
+        self.log_entropy_coeff = torch.tensor(math.log(self.entropy_coeff), device=self.device, requires_grad=True)
+        self.entropy_optimizer = torch.optim.AdamW([self.log_entropy_coeff], lr=self.lr)
+
+        self.optimizer = torch.optim.AdamW(self.policy.parameters(), lr=self.lr, betas=self.betas)
+        self.MseLoss = nn.MSELoss()
+
+    def update(self, memory, env_paras, train_paras):
+        device = env_paras["device"]
+        minibatch_size = train_paras["minibatch_size"]  # batch size for updating
+
+        # Flatten the data in memory (in the dim of parallel instances and decision points)
+        old_ope_ma_adj = torch.stack(memory.ope_ma_adj, dim=0).transpose(0,1).flatten(0,1)
+        old_ope_pre_adj = torch.stack(memory.ope_pre_adj, dim=0).transpose(0, 1).flatten(0, 1)
+        old_ope_sub_adj = torch.stack(memory.ope_sub_adj, dim=0).transpose(0, 1).flatten(0, 1)
+        old_opes_mask_adj = torch.stack(memory.opes_mask_adj, dim=0).transpose(0, 1).flatten(0, 1)
+        old_opes_mask_job = torch.stack(memory.opes_mask_job, dim=0).transpose(0, 1).flatten(0, 1)
+        old_raw_opes = torch.stack(memory.raw_opes, dim=0).transpose(0, 1).flatten(0, 1)
+        old_raw_mas = torch.stack(memory.raw_mas, dim=0).transpose(0, 1).flatten(0, 1)
+        old_proc_pair = torch.stack(memory.proc_pair, dim=0).transpose(0, 1).flatten(0, 1)
+        old_proc_time = torch.stack(memory.proc_time, dim=0).transpose(0, 1).flatten(0, 1)
+        old_jobs_gather = torch.stack(memory.jobs_gather, dim=0).transpose(0, 1).flatten(0, 1)
+        old_eligible = torch.stack(memory.eligible, dim=0).transpose(0, 1).flatten(0, 1)
+        memory_rewards = torch.stack(memory.rewards, dim=0).transpose(0,1)
+        memory_is_terminals = torch.stack(memory.is_terminals, dim=0).transpose(0,1)
+        old_logprobs = torch.stack(memory.logprobs, dim=0).transpose(0,1).flatten(0,1)
+        old_action_envs = torch.stack(memory.action_indexes, dim=0).transpose(0,1).flatten(0, 1)
+   
+        rewards_envs = []
+        initial_discounted_rewards_log = 0 
+
+        for i in range(self.num_envs):
+            rewards = []
+            discounted_reward = 0
+            
+            for reward, is_terminal in zip(reversed(memory_rewards[i]), reversed(memory_is_terminals[i])):
+                if is_terminal:
+                    discounted_reward = reward
+                else: 
+                    discounted_reward = reward + (self.gamma * discounted_reward)
+                rewards.insert(0, discounted_reward)
+            
+            initial_discounted_rewards_log += discounted_reward
+            rewards_envs.append(torch.tensor(rewards, dtype=torch.float64).to(device))
+            
+        rewards_envs = torch.cat(rewards_envs)
+        rewards_envs = (rewards_envs - rewards_envs.mean()) / (rewards_envs.std() + 1e-8)
+
+        # --- PPO Optimization ---
+        
+        loss_epochs = 0
+        full_batch_size = old_ope_ma_adj.size(0)
+        indices = torch.arange(full_batch_size)
+
+        eligible_action = old_eligible.flatten(1, 2).sum(dim=-1).float().mean()
+        target_entropy = self.target_entropy_coeff * torch.log(eligible_action + 1e-8)
+        
+        # Optimize policy for K epochs:
+        for _ in range(self.K_epochs):
+
+            total_entropy = 0
+            shuffled_indices = indices[torch.randperm(full_batch_size)]
+            
+            for start_idx in range(0, full_batch_size, self.minibatch_size):
+                end_idx = start_idx + self.minibatch_size
+                batch_indices = shuffled_indices[start_idx:end_idx]
+                old_logp_batch = old_logprobs[batch_indices].detach() 
+                R_batch = rewards_envs[batch_indices]
+                
+                logprobs, state_values, dist_entropy = \
+                    self.policy.evaluate(old_ope_ma_adj[batch_indices],
+                                         old_ope_pre_adj[batch_indices],
+                                         old_ope_sub_adj[batch_indices],
+                                         old_opes_mask_adj[batch_indices],
+                                         old_opes_mask_job[batch_indices],
+                                         old_raw_opes[batch_indices],
+                                         old_raw_mas[batch_indices],
+                                         old_proc_pair[batch_indices],
+                                         old_proc_time[batch_indices],
+                                         old_jobs_gather[batch_indices],
+                                         old_eligible[batch_indices],
+                                         old_action_envs[batch_indices])      
+
+                state_values = state_values.squeeze(-1)
+                advantages = R_batch - state_values.detach()
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                ratios = torch.exp(logprobs - old_logp_batch)
+
+                # Policy Loss
+                surr1 = ratios * advantages
+                surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
+                policy_loss = - self.A_coeff * torch.min(surr1, surr2)
+                
+                # Value Loss
+                value_loss = self.vf_coeff * F.mse_loss(state_values, R_batch)
+                
+                # Entropy Loss
+                entropy_coeff = self.log_entropy_coeff.exp()
+                entropy_loss = - entropy_coeff.detach() * dist_entropy
+                total_entropy += dist_entropy.detach().mean()
+                
+                # Total Loss
+                loss = policy_loss + value_loss + entropy_loss
+                
+                loss_epochs += loss.mean().detach()
+                self.optimizer.zero_grad()
+                loss.mean().backward()
+                self.optimizer.step()
+            
+            total_entropy = total_entropy / (math.ceil(full_batch_size / self.minibatch_size))
+            entropy_coeff_loss = self.log_entropy_coeff * (total_entropy - target_entropy)
+            self.entropy_optimizer.zero_grad()
+            entropy_coeff_loss.backward()
+            self.entropy_optimizer.step()
+            with torch.no_grad():
+                self.log_entropy_coeff.clamp_(min=math.log(1e-8), max=math.log(0.1))
+          
+        self.policy_old.load_state_dict(self.policy.state_dict())
+        return loss_epochs.item() / (self.K_epochs * math.ceil(full_batch_size / self.minibatch_size)), \
+               initial_discounted_rewards_log.item() / self.num_envs
